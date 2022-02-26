@@ -3,11 +3,15 @@ use regex::Regex;
 
 use super::{Context, Module, RootModuleConfig};
 
-use crate::configs::git_status::GitStatusConfig;
+use crate::configs::gitstatusd::GitstatusdConfig;
 use crate::formatter::StringFormatter;
 use crate::segment::Segment;
 use std::ffi::OsStr;
 use std::sync::Arc;
+
+use gitstatusd::GitDetails;
+
+const MODULE_NAME: &str = "gitstatusd";
 
 const ALL_STATUS_FORMAT: &str = "$conflicted$stashed$deleted$renamed$modified$staged$untracked";
 
@@ -27,10 +31,10 @@ const ALL_STATUS_FORMAT: &str = "$conflicted$stashed$deleted$renamed$modified$st
 ///   - `»` — A renamed file has been added to the staging area
 ///   - `✘` — A file's deletion has been added to the staging area
 pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
-    let mut module = context.new_module("git_status");
-    let config: GitStatusConfig = GitStatusConfig::try_load(module.config);
+    let mut module = context.new_module(MODULE_NAME);
+    let config: GitstatusdConfig = GitstatusdConfig::try_load(module.config);
 
-    let info = Arc::new(GitStatusInfo::load(context, config.clone()));
+    let info = Arc::new(GitstatusdInfo::load(context, config.clone()));
 
     //Return None if not in git repository
     context.get_repo().ok()?;
@@ -114,17 +118,30 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     Some(module)
 }
 
-struct GitStatusInfo<'a> {
-    context: &'a Context<'a>,
-    config: GitStatusConfig<'a>,
-    repo_status: OnceCell<Option<RepoStatus>>,
-    stashed_count: OnceCell<Option<usize>>,
+struct GitstatusdInfo<'a> {
+    gsd: gitstatusd::SatusDaemon,
+    config: GitstatusdConfig<'a>,
+    repo_status: OnceCell<Option<gitstatusd::GitDetails>>,
 }
 
-impl<'a> GitStatusInfo<'a> {
-    pub fn load(context: &'a Context, config: GitStatusConfig<'a>) -> Self {
+impl<'a> GitstatusdInfo<'a> {
+    pub fn load(context: &'a Context, config: GitstatusdConfig<'a>) -> Self {
+        let gsd  = gitstatusd::SatusDaemon::new("/Users/nixon/bin/gitstatusd", context.runtime_dir()).unwrap();
+
+        let d  = gitstatusd::SatusDaemon::new("/Users/nixon/bin/gitstatusd", self.runtime_dir()).unwrap();
+
+        let req_id = "???";
+        let resp = d.request(gitstatusd::StatusRequest {
+            id: &req_id,
+            dir: self.logical_dir,
+            read_index: gitstatusd::ReadIndex::DontRead,
+        })?;
+
+        Ok(resp)
+        // TODO: lookup the existing gitstatusd fd
+        // if not there, we can go ahead and start it in the background under a rundir for us
         Self {
-            context,
+            gsd,
             config,
             repo_status: OnceCell::new(),
             stashed_count: OnceCell::new(),
@@ -182,8 +199,9 @@ impl<'a> GitStatusInfo<'a> {
     }
 }
 
+
 /// Gets the number of files in various git states (staged, modified, deleted, etc...)
-fn get_repo_status(context: &Context, config: &GitStatusConfig) -> Option<RepoStatus> {
+fn get_repo_status(context: &Context, config: &GitstatusdConfig) -> Option<RepoStatus> {
     log::debug!("New repo status created");
 
     let mut repo_status = RepoStatus::default();

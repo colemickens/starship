@@ -22,6 +22,7 @@ use std::str::FromStr;
 use std::string::String;
 use std::time::{Duration, Instant};
 use terminal_size::terminal_size;
+use directories_next::ProjectDirs;
 
 /// Context contains data or common methods that may be used by multiple modules.
 /// The data contained within Context will be relevant to this particular rendering
@@ -37,6 +38,10 @@ pub struct Context<'a> {
     /// though may appear different.
     /// E.g. when navigating to a PSDrive in PowerShell, or a path without symlinks resolved.
     pub logical_dir: PathBuf,
+
+    /// Starship's runtime directory. This is currently only used for gitstatusd to maintain
+    /// a gitstatusd instance per-tty, as powerlevel10k does with its async zsh support.
+    pub runtime_dir: PathBuf,
 
     /// A struct containing directory contents in a lookup-optimised format.
     dir_contents: OnceCell<DirContents>,
@@ -85,6 +90,13 @@ impl<'a> Context<'a> {
     pub fn new(arguments: Properties, target: Target) -> Context<'a> {
         let shell = Context::get_shell();
 
+        let pd = ProjectDirs::from("org", "starship-rs", "starship").unwrap();
+        let me = procfs::process::Process::myself().unwrap();
+        let (_, tty_nr) = me.stat.tty_nr();
+
+        let runtime_dir = pd.runtime_dir().expect("failed to get runtime dir").join(format!("tty{}", tty_nr));
+
+
         // Retrieve the "current directory".
         // If the path argument is not set fall back to the OS current directory.
         let path = arguments
@@ -104,7 +116,7 @@ impl<'a> Context<'a> {
             .or_else(|| env::var("PWD").map(PathBuf::from).ok())
             .unwrap_or_else(|| path.clone());
 
-        Context::new_with_shell_and_path(arguments, shell, target, path, logical_path)
+        Context::new_with_shell_and_path(arguments, shell, target, path, logical_path, runtime_dir)
     }
 
     /// Create a new instance of Context for the provided directory
@@ -113,6 +125,7 @@ impl<'a> Context<'a> {
         shell: Shell,
         target: Target,
         path: PathBuf,
+        runtime_dir: PathBuf,
         logical_path: PathBuf,
     ) -> Context<'a> {
         let config = StarshipConfig::initialize();
@@ -154,6 +167,7 @@ impl<'a> Context<'a> {
             properties,
             current_dir,
             logical_dir,
+            runtime_dir,
             dir_contents: OnceCell::new(),
             repo: OnceCell::new(),
             shell,

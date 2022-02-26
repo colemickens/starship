@@ -30,6 +30,7 @@ pub mod git_commit;
 pub mod git_metrics;
 pub mod git_state;
 pub mod git_status;
+pub mod gitstatusd;
 pub mod go;
 pub mod helm;
 pub mod hg_branch;
@@ -113,6 +114,7 @@ pub struct FullConfig<'a> {
     git_metrics: git_metrics::GitMetricsConfig<'a>,
     git_state: git_state::GitStateConfig<'a>,
     git_status: git_status::GitStatusConfig<'a>,
+    gitstatusd: gitstatusd::GitstatusdConfig<'a>,
     golang: go::GoConfig<'a>,
     helm: helm::HelmConfig<'a>,
     hg_branch: hg_branch::HgBranchConfig<'a>,
@@ -194,6 +196,7 @@ impl<'a> Default for FullConfig<'a> {
             git_metrics: Default::default(),
             git_state: Default::default(),
             git_status: Default::default(),
+            gitstatusd: Default::default(),
             golang: Default::default(),
             helm: Default::default(),
             hg_branch: Default::default(),
