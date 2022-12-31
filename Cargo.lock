@@ -719,12 +719,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitstatusd"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df1b39b028d44bd71fa0766412a34c57c7bce1cad3731d62131f204aa8bdf520"
-
-[[package]]
 name = "hashbrown"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1669,7 +1663,6 @@ dependencies = [
  "directories-next",
  "gethostname",
  "git2",
- "gitstatusd",
  "indexmap",
  "local_ipaddress",
  "log",

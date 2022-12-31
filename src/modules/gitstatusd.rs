@@ -8,8 +8,7 @@ use crate::formatter::StringFormatter;
 use crate::segment::Segment;
 use std::ffi::OsStr;
 use std::sync::Arc;
-
-use gitstatusd::GitDetails;
+use std::{process, io, path, fmt};
 
 const MODULE_NAME: &str = "gitstatusd";
 
@@ -118,49 +117,345 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     Some(module)
 }
 
-struct GitstatusdInfo<'a> {
-    gsd: gitstatusd::SatusDaemon,
-    config: GitstatusdConfig<'a>,
-    repo_status: OnceCell<Option<gitstatusd::GitDetails>>,
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// GITSTATUSD
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#[derive(Debug, PartialEq)]
+/// An error if the responce from gitstatusd couldn't be parsed
+pub enum ResponceParseError {
+    /// Not Enought Parts were recieved
+    TooShort,
+    /// A part was sent, but we cant parse it.
+    InvalidPart,
+    ParseIntError(std::num::ParseIntError),
 }
 
+impl From<std::num::ParseIntError> for ResponceParseError {
+    fn from(e: std::num::ParseIntError) -> Self {
+        Self::ParseIntError(e)
+    }
+}
+
+macro_rules! munch {
+    ($expr:expr) => {
+        match $expr.next() {
+            Some(v) => v,
+            None => return Err($crate::modules::gitstatusd::ResponceParseError::TooShort),
+        }
+    };
+}
+
+impl std::str::FromStr for GitStatus {
+    type Err = ResponceParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        GitStatus::from_str(s)
+    }
+}
+
+impl GitStatus {
+    // TODO: Make this run on &[u8]
+    fn from_str(s: &str) -> Result<Self, ResponceParseError> {
+        let mut parts = s.split("\x1f");
+        let id = munch!(parts);
+        let is_repo = munch!(parts);
+        match is_repo {
+            "0" => {
+                return Ok(GitStatus {
+                    id: id.to_owned(),
+                    details: Option::None,
+                })
+            }
+            // 1 indicated a git repo, so we do the real stuff
+            "1" => {}
+            // If not 0 or 1, give up
+            _ => return Err(ResponceParseError::InvalidPart),
+        }
+
+        let abspath = munch!(parts);
+        let head_commit_hash = munch!(parts);
+        let local_branch = munch!(parts);
+        let upstream_branch = munch!(parts);
+        let remote_name = munch!(parts);
+        let remote_url = munch!(parts);
+        let repository_state = munch!(parts);
+
+        let num_files_in_index: u32 = munch!(parts).parse()?;
+        let num_staged_changes: u32 = munch!(parts).parse()?;
+        let num_unstaged_changes: u32 = munch!(parts).parse()?;
+        let num_conflicted_changes: u32 = munch!(parts).parse()?;
+        let num_untrached_files: u32 = munch!(parts).parse()?;
+        let commits_ahead: u32 = munch!(parts).parse()?;
+        let commits_behind: u32 = munch!(parts).parse()?;
+        let num_stashes: u32 = munch!(parts).parse()?;
+        let last_tag = munch!(parts);
+        let num_unstaged_deleted: u32 = munch!(parts).parse()?;
+        let num_staged_new: u32 = munch!(parts).parse()?;
+        let num_staged_deleted: u32 = munch!(parts).parse()?;
+        let push_remote_name = munch!(parts);
+        let push_remote_url: &str = munch!(parts);
+        let commits_ahead_push_remote: u32 = munch!(parts).parse()?;
+        let commits_behind_push_remote: u32 = munch!(parts).parse()?;
+        let num_index_skip_worktree: u32 = munch!(parts).parse()?;
+        let num_index_assume_unchanged: u32 = munch!(parts).parse()?;
+
+        // Only do ownership once we have all the stuff
+        let git_part = GitDetails {
+            abspath: abspath.to_owned(),
+            head_commit_hash: head_commit_hash.to_owned(),
+            local_branch: local_branch.to_owned(),
+            upstream_branch: upstream_branch.to_owned(),
+            remote_name: remote_name.to_owned(),
+            remote_url: remote_url.to_owned(),
+            repository_state: repository_state.to_owned(),
+            num_files_in_index,
+            num_staged_changes,
+            num_unstaged_changes,
+            num_conflicted_changes,
+            num_untrached_files,
+            commits_ahead,
+            commits_behind,
+            num_stashes,
+            last_tag: last_tag.to_owned(),
+            num_unstaged_deleted,
+            num_staged_new,
+            num_staged_deleted,
+            push_remote_name: push_remote_name.to_owned(),
+            push_remote_url: push_remote_url.to_owned(),
+            commits_ahead_push_remote,
+            commits_behind_push_remote,
+            num_index_skip_worktree,
+            num_index_assume_unchanged,
+        };
+
+        Ok(GitStatus {
+            id: id.to_owned(),
+            details: Option::Some(git_part),
+        })
+    }
+}
+
+
+struct GitStatusDaemon {
+    // I need to store the child so it's pipes don't close
+    _proc: process::Child,
+    stdin: process::ChildStdin,
+    stdout: io::BufReader<process::ChildStdout>,
+    // TODO: decide if I need this
+    _stderr: process::ChildStderr,
+}
+
+struct GitstatusdInfo<'a> {
+    config: GitstatusdConfig<'a>,
+    context: &'a Context<'a>,
+    repo_status: OnceCell<Option<GitDetails>>,
+}
+
+#[derive(Copy, Clone, Debug, Hash)]
+/// Tell gitstatusd weather or not to read the git index
+pub enum ReadIndex {
+    /// default behavior of computing everything
+    ReadAll = 0,
+    /// Disables computation of anything that requires reading git index
+    DontRead = 1,
+}
+
+/// A Request to be sent to the demon.
+pub struct StatusRequest {
+    // TODO: Are these always utf-8
+    // TODO: borrow these
+    /// The request Id, can be blank
+    pub id: String,
+    /// Path to the directory for which git stats are being requested.
+    ///
+    /// If the first character is ':', it is removed and the remaning path is
+    /// treated as GIT_DIR.
+    pub dir: String,
+    /// Wether or not to read the git index
+    pub read_index: ReadIndex,
+}
+
+// TODO, this should probably work for non utf8.
+impl fmt::Display for StatusRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{id}\x1f{dir}\x1f{index}\x1e",
+            id = self.id,
+            dir = self.dir,
+            index = self.read_index as u8
+        )
+    }
+}
+
+impl GitStatusDaemon {
+    // TODO: does the path matter
+    // TODO: binary detection
+    /// Create a new status demon.
+    ///
+    /// - `bin_path`: The path to the `gitstatusd` binary.
+    /// - `run_dir`: The directory to run the binary in.
+    pub fn new<C: AsRef<OsStr> + Default, P: AsRef<path::Path>>(
+        bin_path: C,
+        run_dir: P,
+    ) -> io::Result<GitStatusDaemon> {
+        let mut proc = process::Command::new(bin_path)
+            .current_dir(run_dir)
+            .stdin(process::Stdio::piped())
+            .stdout(process::Stdio::piped())
+            .stderr(process::Stdio::piped())
+            .spawn()?;
+
+        let stdin = proc.stdin.take().ok_or(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "Couldn't obtain stdin",
+        ))?;
+        let stdout = io::BufReader::new(proc.stdout.take().ok_or(
+            io::Error::new(io::ErrorKind::BrokenPipe, "Couldn't obtain stdout"),
+        )?);
+        let stderr = proc.stderr.take().ok_or(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "Couldn't obtain stderr",
+        ))?;
+
+        Ok(GitStatusDaemon {
+            _proc: proc,
+            stdin,
+            stdout,
+            _stderr: stderr,
+        })
+    }
+
+    //TODO: Better Error Handling
+    //TODO: Non blocking version
+    //TODO: Id generation
+    /// Get the git status
+    pub fn request(&mut self, r: StatusRequest) -> io::Result<GitStatus> {
+
+        let mut file = File::open(self.pidfile)?;
+        let mut string = String::new();
+        let pid = file.read_to_string(&mut string)?;
+
+        // connect to pid with procfs?
+
+        println!("{:?}", pid);
+        let status = GitStatus::Default();
+        Ok(status)
+    }
+}
+
+
+#[derive(Debug, PartialEq)]
+/// The result of a request for the git status.
+///
+/// If the request was inside a git reposity, `details` will contain a
+/// `GitDetails` with the results
+pub struct GitStatus {
+    /// Request id. The same as the first field in the request.
+    pub id: String,
+    /// The inner responce.
+    pub details: Option<GitDetails>,
+}
+
+
+
+/// Details about git state.
+///
+/// Note: Renamed files are reported as deleted plus new.
+#[derive(Debug, PartialEq)]
+pub struct GitDetails {
+    /// Absolute path to the git repository workdir.
+    pub abspath: String,
+    /// Commit hash that HEAD is pointing to. 40 hex digits.
+    // TODO: Change the type
+    pub head_commit_hash: String,
+    // TODO: Docs unclear
+    /// Local branch name or empty if not on a branch.
+    pub local_branch: String,
+    /// Upstream branch name. Can be empty.
+    pub upstream_branch: String,
+    /// The remote name, e.g. "upstream" or "origin".
+    pub remote_name: String,
+    /// Remote URL. Can be empty.
+    pub remote_url: String,
+    /// Repository state, A.K.A. action. Can be empty.
+    pub repository_state: String,
+    /// The number of files in the index.
+    pub num_files_in_index: u32,
+    /// The number of staged changes.
+    pub num_staged_changes: u32,
+    /// The number of unstaged changes.
+    pub num_unstaged_changes: u32,
+    /// The number of conflicted changes.
+    pub num_conflicted_changes: u32,
+    /// The number of untracked files.
+    pub num_untrached_files: u32,
+    /// Number of commits the current branch is ahead of upstream.
+    pub commits_ahead: u32,
+    /// Number of commits the current branch is behind upstream.
+    pub commits_behind: u32,
+    /// The number of stashes.
+    pub num_stashes: u32,
+    /// The last tag (in lexicographical order) that points to the same
+    /// commit as HEAD.
+    pub last_tag: String,
+    /// The number of unstaged deleted files.
+    pub num_unstaged_deleted: u32,
+    /// The number of staged new files.
+    pub num_staged_new: u32,
+    /// The number of staged deleted files.
+    pub num_staged_deleted: u32,
+    /// The push remote name, e.g. "upstream" or "origin".
+    pub push_remote_name: String,
+    /// Push remote URL. Can be empty.
+    pub push_remote_url: String,
+    /// Number of commits the current branch is ahead of push remote.
+    pub commits_ahead_push_remote: u32,
+    /// Number of commits the current branch is behind push remote.
+    pub commits_behind_push_remote: u32,
+    /// Number of files in the index with skip-worktree bit set.
+    pub num_index_skip_worktree: u32,
+    /// Number of files in the index with assume-unchanged bit set.
+    pub num_index_assume_unchanged: u32,
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// GITSTATUSD (END)
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// TODO: make the read_index configureable
+// TODO: gitstatusd should use osstring? or pathbuf?
 impl<'a> GitstatusdInfo<'a> {
     pub fn load(context: &'a Context, config: GitstatusdConfig<'a>) -> Self {
-        let gsd  = gitstatusd::SatusDaemon::new("/Users/nixon/bin/gitstatusd", context.runtime_dir()).unwrap();
-
-        let d  = gitstatusd::SatusDaemon::new("/Users/nixon/bin/gitstatusd", self.runtime_dir()).unwrap();
-
-        let req_id = "???";
-        let resp = d.request(gitstatusd::StatusRequest {
-            id: &req_id,
-            dir: self.logical_dir,
-            read_index: gitstatusd::ReadIndex::DontRead,
-        })?;
-
-        Ok(resp)
-        // TODO: lookup the existing gitstatusd fd
-        // if not there, we can go ahead and start it in the background under a rundir for us
         Self {
-            gsd,
             config,
+            context,
             repo_status: OnceCell::new(),
-            stashed_count: OnceCell::new(),
+        }
+    }
+
+    pub fn get_repo_status(&self) -> &Option<GitDetails> {
+        let req_id = "???";
+        let _gsd = GitStatusDaemon::new(
+            "gitstatusd", self.context.runtime_dir);
+
+        match _gsd {
+            Ok(gsd) => {
+                let req = StatusRequest {
+                    id: req_id.to_string(),
+                    dir: self.context.logical_dir.to_string_lossy().into_owned(),
+                    read_index: ReadIndex::DontRead,
+                };
+                match gsd.request(req) {
+                    Ok(resp) => &resp.details,
+                    Err(_) => &None,
+                }
+            },
+            Err(_) => &None,
         }
     }
 
     pub fn get_ahead_behind(&self) -> Option<(Option<usize>, Option<usize>)> {
         self.get_repo_status().map(|data| (data.ahead, data.behind))
-    }
-
-    pub fn get_repo_status(&self) -> &Option<RepoStatus> {
-        self.repo_status
-            .get_or_init(|| match get_repo_status(self.context, &self.config) {
-                Some(repo_status) => Some(repo_status),
-                None => {
-                    log::debug!("get_repo_status: git status execution failed");
-                    None
-                }
-            })
     }
 
     pub fn get_stashed(&self) -> &Option<usize> {
@@ -198,7 +493,6 @@ impl<'a> GitstatusdInfo<'a> {
         self.get_repo_status().map(|data| data.untracked)
     }
 }
-
 
 /// Gets the number of files in various git states (staged, modified, deleted, etc...)
 fn get_repo_status(context: &Context, config: &GitstatusdConfig) -> Option<RepoStatus> {
